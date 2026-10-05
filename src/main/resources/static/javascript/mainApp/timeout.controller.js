@@ -6,7 +6,8 @@
      * Controller for the timeout functionality. When a user is idle for more than 30 min, user will be logged out.
      * Also displays timeout warning modal when 5 minutes are left in the timer.
      *
-     * If user clicks or presses any key within the 30 min of inactivity, timer is reset.
+     * If user clicks or presses any key within the 30 min of inactivity, timer is reset. So does each poll of an async
+     * job (see dataProvider), so a user waiting on a long job such as a large import is not logged out.
      *
      * @param $scope - Binding between controller and HTML page
      * @param $window - A reference to the browser's window object
@@ -89,6 +90,13 @@
             });
         });
 
+        // If an async job the user is waiting on is polled, reset timeout
+        $scope.$on("asyncJobPolled", () => {
+            if (!isModalOpen) {
+                $timeout.cancel(displayTimeoutModalPromise);
+            }
+        });
+
         /**
          * Clear timeouts and intervals when DOM is destroyed.
          */
@@ -98,7 +106,7 @@
                 displayTimeoutModalPromise = {};
             }
             if (angular.isDefined(countdownTimerPromise)) {
-                $timeout.cancel(countdownTimerPromise);
+                $interval.cancel(countdownTimerPromise);
                 countdownTimerPromise = {};
             }
         });
@@ -120,7 +128,7 @@
          */
         const restartCountdown = () => {
             $interval.cancel(countdownTimerPromise);
-            countdownTimerPromise = {};
+            countdownTimerPromise = undefined;
             $scope.secondsRemaining = TIME_TO_LOGOUT;
             $scope.timeRemaining = secondsToMinutes(TIME_TO_LOGOUT);
         };

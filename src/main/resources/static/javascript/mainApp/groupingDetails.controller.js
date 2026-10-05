@@ -14,9 +14,10 @@
      * @param Threshold - threshold object constant from app.constants.js
      * @param Utility - utility function constant from app.constants.js
      * @param $timeout - AngularJS wrapper for window.setTimeout
+     * @param MEMBER_PAGES_IN_FLIGHT - the most member pages requested at once, from app.constants.js
      */
     function GroupingDetailsJsController($scope, $controller, $window, $uibModal, groupingsService, PAGE_SIZE, Message,
-        Threshold, Utility, ORPHAN_HELP_URL, $timeout) {
+        Threshold, Utility, ORPHAN_HELP_URL, $timeout, MEMBER_PAGES_IN_FLIGHT) {
 
         $scope.orphanHelpUrl = ORPHAN_HELP_URL;
         $scope.isOrphanMember = (member) => member && member.orphan === true;
@@ -193,14 +194,8 @@
         };
 
         /**
-         * Return a sorted list of distinct members.
-         * @param {object[]} members - the members of the group
-         * @returns {object[]} the members of the group, sorted by name
-         */
-        const setGroupMembers = (members) => sortGroupMembers(members);
-
-        /**
-         * Concatenate initialMembers and membersToAdd into one sorted list of distinct members.
+         * Concatenate initialMembers and membersToAdd into one sorted list of distinct members. A member in both is
+         * taken from initialMembers.
          * @param {object[]} initialMembers - initial members in group
          * @param {object[]} membersToAdd - members to add to group
          * @returns {object[]} the members of both groups in one array, sorted by name
@@ -209,10 +204,112 @@
             sortGroupMembers(_.concat(initialMembers, membersToAdd));
 
         /**
-         * Get information about the grouping including members and description.
+         * Helper - fetchGrouping
+         * The members of the grouping (Basis and Include, minus Exclude), each with where it is listed. They are
+         * worked out from the whole lists loaded so far, because the API's members of a page (allMembers) only
+         * account for the Basis, Include, and Exclude members on that same page.
+         * @param {object[]} basis - the members of the Basis list
+         * @param {object[]} include - the members of the Include list
+         * @param {object[]} exclude - the members of the Exclude list
+         * @returns {object[]} the members of the grouping, sorted by name
+         */
+        const groupingMembersOf = (basis, include, exclude) => {
+            const excluded = new Set(exclude.map((member) => member.uhUuid));
+            const included = new Set(include.map((member) => member.uhUuid));
+            const inBasis = new Set(basis.map((member) => member.uhUuid));
+            const asMember = (member, whereListed) => ({
+                name: member.name,
+                firstName: member.firstName,
+                lastName: member.lastName,
+                uid: member.uid,
+                uhUuid: member.uhUuid,
+                orphan: member.orphan,
+                whereListed
+            });
+            const members = [
+                ...basis.filter((member) => !excluded.has(member.uhUuid))
+                    .map((member) => asMember(member, included.has(member.uhUuid) ? "Basis & Include" : "Basis")),
+                ...include.filter((member) => !excluded.has(member.uhUuid) && !inBasis.has(member.uhUuid))
+                    .map((member) => asMember(member, "Include"))
+            ];
+            return sortGroupMembers(members);
+        };
+
+        /**
+         * Helper - fetchGrouping
+         * Add a page of members to the grouping's Basis, Include, and Exclude lists, and work out its members again.
+         * @param {object} res - the page of members (GroupingGroupsMembers)
+         */
+        const addMemberPage = (res) => {
+            $scope.groupingBasis = combineGroupMembers(res.groupingBasis.members, $scope.groupingBasis);
+            $scope.filter($scope.groupingBasis, "pagedItemsBasis", "currentPageBasis", $scope.basisQuery, false);
+
+            $scope.groupingInclude = combineGroupMembers(res.groupingInclude.members, $scope.groupingInclude);
+            $scope.groupingExclude = combineGroupMembers(res.groupingExclude.members, $scope.groupingExclude);
+            // Any page can add Basis members, so whether each Include and Exclude member is in Basis is checked again.
+            $scope.addInBasis($scope.groupingInclude);
+            $scope.addInBasis($scope.groupingExclude);
+            $scope.filter($scope.groupingInclude, "pagedItemsInclude", "currentPageInclude", $scope.includeQuery, false);
+            $scope.filter($scope.groupingExclude, "pagedItemsExclude", "currentPageExclude", $scope.excludeQuery, false);
+            // The Reset Include and Reset Exclude checkboxes are disabled while their list is empty.
+            $scope.disableResetCheckboxes();
+
+            $scope.groupingMembers =
+                groupingMembersOf($scope.groupingBasis, $scope.groupingInclude, $scope.groupingExclude);
+            $scope.filter($scope.groupingMembers, "pagedItemsMembers", "currentPageMembers", $scope.membersQuery, false);
+        };
+
+        // Counts the loads of grouping information, so that a load stops fetching member pages once another starts.
+        let memberLoads = 0;
+
+        /**
+         * Helper - getGroupingInformation
+         * Fetch the pages of the members of groupPaths, MEMBER_PAGES_IN_FLIGHT at a time, until a page is past the
+         * last members, a page fails, or isCurrent() turns false (another load has started, or the grouping was left).
+         * @param {string[]} groupPaths - the paths of the Basis, Include, and Exclude lists
+         * @param {function} isCurrent - whether this load should keep fetching pages
+         * @returns {Promise<boolean>} whether every page of members was fetched
+         */
+        const fetchMemberPages = (groupPaths, isCurrent) => new Promise((resolve) => {
+            let nextPage = 1;
+            let inFlight = 0;
+            let stopped = false;
+            let complete = false;
+            let failed = false;
+            const fetchNextPage = () => {
+                if (stopped || !isCurrent()) {
+                    stopped = true;
+                    if (inFlight === 0) {
+                        resolve(complete && !failed);
+                    }
+                    return;
+                }
+                const page = nextPage++;
+                inFlight++;
+                $scope.fetchGrouping(page, groupPaths, isCurrent).then((outcome) => {
+                    inFlight--;
+                    if (outcome !== "more") {
+                        stopped = true;
+                        complete = complete || outcome === "complete";
+                        failed = failed || outcome === "failed";
+                    }
+                    fetchNextPage();
+                });
+            };
+            for (let i = 0; i < MEMBER_PAGES_IN_FLIGHT; i++) {
+                fetchNextPage();
+            }
+        });
+
+        /**
+         * Get information about the grouping including members and description. The owners are fetched once, then
+         * the pages of members, MEMBER_PAGES_IN_FLIGHT at a time.
          */
         $scope.getGroupingInformation = async () => {
+            const load = ++memberLoads;
             loadMembersList = true;
+            $scope.groupingBasis = [];
+            $scope.pagedItemsBasis = [];
             $scope.groupingInclude = [];
             $scope.pagedItemsInclude = [];
             $scope.groupingExclude = [];
@@ -221,62 +318,55 @@
             $scope.pagedItemsMembers = [];
             const groupingPath = $scope.selectedGrouping.path;
             const paths = [groupingPath + ":basis", groupingPath + ":include", groupingPath + ":exclude"];
-            let currentPage = 1;
             $scope.setPage("First", "currentPageMembers", "pagedItemsMembers");
             $scope.loading = true;
             $scope.paginatingComplete = false;
             await $scope.getGroupingDescription(groupingPath);
             await $scope.getGroupingSyncDest(groupingPath);
             await $scope.getGroupingOptAttributes(groupingPath);
-            while (!($scope.paginatingComplete) && loadMembersList) {
-                $scope.paginatingProgress = true;
-                $scope.disableResetCheckboxes();
-                await $scope.fetchOwners(groupingPath);
-                await $scope.fetchDuplicateOwners(groupingPath);
-                await $scope.fetchGrouping(currentPage, paths);
-                currentPage++;
+            $scope.paginatingProgress = true;
+            $scope.disableResetCheckboxes();
+            await $scope.fetchOwners(groupingPath);
+            await $scope.fetchDuplicateOwners(groupingPath);
+            const complete = await fetchMemberPages(paths, () => loadMembersList && load === memberLoads);
+            if (load === memberLoads) {
+                if (complete) {
+                    $scope.paginatingComplete = true;
+                }
+                $scope.paginatingProgress = false;
                 $scope.loading = false;
+                loadMembersList = false;
             }
-            loadMembersList = false;
             $scope.$applyAsync();
         };
 
         /**
-         * Fetches all the members from each of the specified group paths
-         * @param currentPage - Keeps track of current page in groupings
+         * Fetches a page of the members of each of the specified group paths, and adds them to the grouping's lists.
+         * A page that arrives once its load is no longer current (isCurrent() is false) is dropped, failed or not: the
+         * lists now belong to another load, and the first failure of a load has already been reported.
+         * @param currentPage - the page to fetch
          * @param groupPaths - Holds the group paths which the members are retrieved from
+         * @param {function} [isCurrent] - whether the load that fetches the page is still current
+         * @returns {Promise<string>} "more" when the page had members, "complete" when it was past the last members
+         * of every group, and "failed" when the request failed
          */
-        $scope.fetchGrouping = (currentPage, groupPaths) => {
+        $scope.fetchGrouping = (currentPage, groupPaths, isCurrent = () => true) => {
             return new Promise((resolve) => {
                 groupingsService.getGrouping(groupPaths, currentPage, PAGE_SIZE, "name", true, (res) => {
                     if (res.paginationComplete) {
-                        $scope.paginatingComplete = true;
-                        $scope.paginatingProgress = false;
-                        $scope.loading = false;
-                    } else if (res.groupingBasis.groupPath.slice(0, -6) === ($scope.selectedGrouping.path)) {
-                        let putGroupMembers = combineGroupMembers;
-                        if (currentPage === 1) {
-                            putGroupMembers = setGroupMembers;
-                        }
-                        $scope.groupingBasis = putGroupMembers(res.groupingBasis.members, $scope.groupingBasis);
-                        $scope.filter($scope.groupingBasis, "pagedItemsBasis", "currentPageBasis", $scope.basisQuery, false);
-
-                        $scope.groupingInclude = putGroupMembers(res.groupingInclude.members, $scope.groupingInclude);
-                        $scope.addInBasis($scope.groupingInclude);
-                        $scope.filter($scope.groupingInclude, "pagedItemsInclude", "currentPageInclude", $scope.includeQuery, false);
-
-                        $scope.groupingExclude = putGroupMembers(res.groupingExclude.members, $scope.groupingExclude);
-                        $scope.addInBasis($scope.groupingExclude);
-                        $scope.filter($scope.groupingExclude, "pagedItemsExclude", "currentPageExclude", $scope.excludeQuery, false);
-
-                        $scope.groupingMembers = putGroupMembers(res.allMembers.members, $scope.groupingMembers);
-                        $scope.filter($scope.groupingMembers, "pagedItemsMembers", "currentPageMembers", $scope.membersQuery, false);
-
+                        resolve("complete");
+                        return;
+                    }
+                    if (isCurrent() && res.groupingBasis.groupPath.slice(0, -6) === ($scope.selectedGrouping.path)) {
+                        addMemberPage(res);
                         $scope.loading = false;
                     }
-                    resolve();
-
+                    resolve("more");
                 }, (res) => {
+                    if (!isCurrent()) {
+                        resolve("failed");
+                        return;
+                    }
                     $scope.paginatingComplete = true;
                     $scope.resStatus = res.status;
                     if (res === null) {
@@ -289,7 +379,7 @@
                         $scope.displayApiErrorModal();
                     }
                     loadMembersList = false;
-                    resolve();
+                    resolve("failed");
                 });
             });
         };
@@ -435,43 +525,37 @@
         };
 
         /**
+         * Helper - addInBasis, addInInclude, addInExclude
+         * Set the property key of each member of group to "Yes" if the member is in list, and to "No" if not. The
+         * list's UH numbers are collected once, so checking a whole large list takes one pass over each.
+         * @param {object[]} group - the members to mark
+         * @param {object[]} list - the members of the list to check against
+         * @param {string} key - the property to set
+         */
+        const markListed = (group, list, key) => {
+            const listed = new Set(list.map((member) => member.uhUuid));
+            group.forEach((member) => {
+                member[key] = listed.has(member.uhUuid) ? "Yes" : "No";
+            });
+        };
+
+        /**
          * Check if the members in the group are in the basis group.
          * @param {object[]} group - the group to check
          */
-        $scope.addInBasis = (group) => {
-            group.forEach((member) => {
-                const memberUhUuid = member.uhUuid;
-                member.inBasis = _.some($scope.groupingBasis, { uhUuid: memberUhUuid })
-                    ? "Yes"
-                    : "No";
-            });
-        };
+        $scope.addInBasis = (group) => markListed(group, $scope.groupingBasis, "inBasis");
 
         /**
          * Check if the members in the group are in the include group.
          * @param {object[]} group - the group to check
          */
-        $scope.addInInclude = (group) => {
-            group.forEach((member) => {
-                const memberUhUuid = member.uhUuid;
-                member.inInclude = _.some($scope.groupingInclude, { uhUuid: memberUhUuid })
-                    ? "Yes"
-                    : "No";
-            });
-        };
+        $scope.addInInclude = (group) => markListed(group, $scope.groupingInclude, "inInclude");
 
         /**
          * Check if the members in the group are in the exclude group.
          * @param {object[]} group - the group to check
          */
-        $scope.addInExclude = (group) => {
-            group.forEach((member) => {
-                const memberUhUuid = member.uhUuid;
-                member.inExclude = _.some($scope.groupingExclude, { uhUuid: memberUhUuid })
-                    ? "Yes"
-                    : "No";
-            });
-        };
+        $scope.addInExclude = (group) => markListed(group, $scope.groupingExclude, "inExclude");
 
         /**
          * Check if the members in the group are in Basis, Include, and Exclude groups.
@@ -1031,36 +1115,83 @@
         };
 
         /**
-         * Helper - addMembers
-         * CSV/text file imports: validate every identifier up front so a handful of bad entries
-         * don't block the rest of the file, then add only the identifiers Grouper can resolve and
-         * report the difference (see handleSuccessfulAdd).
-         * @param {string} listName
+         * Helper - importFile
+         * Validates the identifiers of a CSV/text file import up front, so a handful of bad entries don't block the
+         * rest of the file.
          * @param {Object[]} identifiers - the sanitized identifiers to validate
-         * @param {Object[]} importEntries - the entries that the import reports on
+         * @param {function} onValidated - called with the identifiers that Grouper could not resolve
          */
-        const validateFileImport = (listName, identifiers, importEntries) => {
-            const acceptedIdentifiers = new Set(identifiers);
-            $scope.importTotalCount = importEntries.length;
+        const validateFileImport = (identifiers, onValidated) => {
             $scope.waitingForImportResponse = true; // Small spinner on
             groupingsService.getMemberAttributeResultsAsync(identifiers, (res) => {
                 $scope.waitingForImportResponse = false;
-                const invalidIdentifiers = new Set(res.invalid);
+                $scope.isAddingMembers = false;
+                onValidated(res.invalid);
+            }, handleAddApiError);
+        };
+
+        /**
+         * Helper - addMembers
+         * Imports the identifiers of a CSV/text file, then displays its results: the number of members imported and
+         * the entries that are not valid identifiers (rejected by the sanitizer, or unknown to Grouper), in file order.
+         *
+         * An import of more than Threshold.MULTI_ADD entries is confirmed, with its large import warning, before
+         * anything is sent, and then all of its identifiers are added at once: the add validates them itself and
+         * reports the ones it could not resolve, so validating them separately first would only double the Grouper
+         * lookups of an import that already takes minutes. A smaller import is validated first, then confirmed with the
+         * number of members that can be added.
+         *
+         * The user can add or import other members while an import runs, which changes the $scope values that the
+         * results are displayed from, so the import keeps its own until it displays them.
+         * @param {string} listName
+         * @param {Object[]} identifiers - the sanitized identifiers to import
+         * @param {Object[]} importEntries - the entries that the import reports on
+         */
+        const importFile = (listName, identifiers, importEntries) => {
+            const groupingPath = $scope.selectedGrouping.path;
+            const importContext = {
+                listName,
+                importTotalCount: importEntries.length,
+                importDuplicateCount: $scope.importDuplicateCount,
+                importSourceRows: $scope.importSourceRows,
+                importFileBaseName: $scope.importFileBaseName
+            };
+            const displayImportResults = (invalidIdentifiers) => {
+                const invalid = new Set(invalidIdentifiers);
+                const acceptedIdentifiers = new Set(identifiers);
+                Object.assign($scope, importContext);
                 // Entries the sanitizer rejected never reached the API, but are as unusable as those it reports.
                 $scope.importInvalidMembers = importEntries.filter(
-                    (id) => invalidIdentifiers.has(id) || !acceptedIdentifiers.has(id));
-                const validIdentifiers = identifiers.filter((id) => !invalidIdentifiers.has(id));
-                $scope.importSuccessCount = validIdentifiers.length;
+                    (entry) => invalid.has(entry) || !acceptedIdentifiers.has(entry));
+                $scope.importSuccessCount = identifiers.filter((id) => !invalid.has(id)).length;
+                $scope.displayImportFileResultsModal();
+            };
+
+            if (importEntries.length <= Threshold.MULTI_ADD) {
+                validateFileImport(identifiers, (invalidIdentifiers) => {
+                    const invalid = new Set(invalidIdentifiers);
+                    const validIdentifiers = identifiers.filter((id) => !invalid.has(id));
+                    // Nothing resolved to a real member: skip the add call and just report the failures.
+                    if (_.isEmpty(validIdentifiers)) {
+                        displayImportResults(invalidIdentifiers);
+                        return;
+                    }
+                    openImportConfirmationModal(listName, validIdentifiers.length).then(() => {
+                        addMembersAsync(listName, groupingPath, validIdentifiers,
+                            () => displayImportResults(invalidIdentifiers));
+                    }, () => { /* onRejected: the import was cancelled */
+                    });
+                });
+                return;
+            }
+
+            openImportConfirmationModal(listName, importEntries.length).then(() => {
                 $scope.isAddingMembers = false;
-
-                // Nothing resolved to a real member: skip the add call and just report the failures.
-                if (_.isEmpty(validIdentifiers)) {
-                    $scope.displayImportFileResultsModal();
-                    return;
-                }
-
-                $scope.displayImportConfirmationModal(listName, validIdentifiers);
-            }, handleAddApiError);
+                addMembersAsync(listName, groupingPath, identifiers,
+                    (res) => displayImportResults(res.invalidUhIdentifiers));
+            }, () => { /* onRejected: the import was cancelled */
+                $scope.isAddingMembers = false;
+            });
         };
 
         /**
@@ -1182,7 +1313,8 @@
         /**
          * Add uhIdentifiers to a group. Leave the uhIdentifiers parameter null to take the member input from
          * $scope.manageMembers. Checks that all uhIdentifiers are valid before displaying the
-         * add/multiAdd/importConfirmation modal.
+         * add/multiAdd/importConfirmation modal, except for a large file import, which is confirmed first
+         * (see importFile).
          * @param {string} listName
          * @param {Object[]|null} uhIdentifiers
          */
@@ -1212,7 +1344,7 @@
             }
 
             if ($scope.isFileImport) {
-                validateFileImport(listName, identifiers, importEntries);
+                importFile(listName, identifiers, importEntries);
                 return;
             }
 
@@ -1227,18 +1359,11 @@
 
         /**
          * Handler for successful member add.
-         * Displays the appropriate modal if it was batch-import, multi-add, or single add.
+         * Displays the appropriate modal if it was batch-import, multi-add, or single add. A CSV/text file import
+         * displays its own results instead (see importFile).
          */
         const handleSuccessfulAdd = (res) => {
             $scope.loading = false; // Full-screen spinner off
-
-            // CSV/text file imports report a success count plus any identifiers Grouper could not
-            // resolve (already computed in addMembers), rather than sharing the dynamic/batch-import
-            // modals used by manual add flows.
-            if ($scope.isFileImport) {
-                $scope.displayImportFileResultsModal();
-                return;
-            }
 
             // Display the appropriate result modal
             if ($scope.isBatchImport) {
@@ -1372,13 +1497,14 @@
         };
 
         /**
-         * Display a modal to confirm/cancel the import
-         * @param listName - current list
-         * @param membersToAdd - the members to add
+         * Open the import confirmation modal, which warns that a large import can take minutes.
+         * @param {string} listName - current list
+         * @param {number} importSize - the number of members to import
+         * @returns {Promise} the result of the modal: resolved on "Yes", rejected on "Cancel"
          */
-        $scope.displayImportConfirmationModal = (listName, membersToAdd) => {
+        const openImportConfirmationModal = (listName, importSize) => {
             // Set information to be displayed in the modal
-            $scope.importSize = membersToAdd.length;
+            $scope.importSize = importSize;
             $scope.listName = listName;
             $scope.isMultiAdd = true;
             $scope.waitingForImportResponse = false;
@@ -1390,16 +1516,64 @@
                 backdrop: "static",
                 ariaLabelledBy: "import-confirmation-modal"
             });
+            return $scope.importConfirmationModalInstance.result;
+        };
 
-            // On pressing "Add" in the modal, make API call to add members to the group
+        /**
+         * Add members to the Include or Exclude list with the async endpoints used for imports. While the add runs,
+         * $scope.importProgress holds how far it has gotten, which the add's list shows next to the import spinner.
+         * @param {string} listName - "Include" or "Exclude"
+         * @param {string} groupingPath - the path of the grouping to add to
+         * @param {Object[]} membersToAdd - the members to add
+         * @param {function} [onSuccess] - handles the result of the add
+         */
+        const addMembersAsync = (listName, groupingPath, membersToAdd, onSuccess = handleSuccessfulAdd) => {
+            $scope.waitingForImportResponse = true; // Small spinner on
+            $scope.importProgress = null;
+            const onProgress = (progress) => {
+                $scope.importProgress = { ...progress, listName };
+            };
+            const whenDone = (handler) => (res) => {
+                $scope.importProgress = null;
+                handler(res);
+            };
+            if (listName === "Include") {
+                groupingsService.addIncludeMembersAsync(membersToAdd, groupingPath, whenDone(onSuccess),
+                    whenDone(handleUnsuccessfulRequest), displaySlowImportModal, onProgress);
+            } else if (listName === "Exclude") {
+                groupingsService.addExcludeMembersAsync(membersToAdd, groupingPath, whenDone(onSuccess),
+                    whenDone(handleUnsuccessfulRequest), displaySlowImportModal, onProgress);
+            }
+        };
+
+        /**
+         * The text that shows how far an import has gotten, e.g. "Adding 4,000 of 12,284 members to the Include
+         * list...". A move removes members from the list opposite the one they are added to.
+         * @param {Object} progress - $scope.importProgress: the phase, done, total, and listName of an import
+         * @returns {string} the text, or an empty string for a phase without one
+         */
+        $scope.importProgressText = (progress) => {
+            const message = progress ? Message.ImportProgress[progress.phase] : null;
+            if (!message) {
+                return "";
+            }
+            const listName = progress.phase === "REMOVING"
+                ? (progress.listName === "Include" ? "Exclude" : "Include")
+                : progress.listName;
+            return message.with(progress.done.toLocaleString("en-US"), progress.total.toLocaleString("en-US"), listName);
+        };
+
+        /**
+         * Display a modal to confirm/cancel the import of more than Threshold.MULTI_ADD members entered in the add box.
+         * A CSV/text file import confirms its own import (see importFile).
+         * @param listName - current list
+         * @param membersToAdd - the members to add
+         */
+        $scope.displayImportConfirmationModal = (listName, membersToAdd) => {
+            // On pressing "Yes" in the modal, make API call to add members to the group
             const groupingPath = $scope.selectedGrouping.path;
-            $scope.importConfirmationModalInstance.result.then(async () => {
-                $scope.waitingForImportResponse = true; // Small spinner on
-                if ($scope.listName === "Include") {
-                    await groupingsService.addIncludeMembersAsync(membersToAdd, groupingPath, handleSuccessfulAdd, handleUnsuccessfulRequest, displaySlowImportModal);
-                } else if ($scope.listName === "Exclude") {
-                    await groupingsService.addExcludeMembersAsync(membersToAdd, groupingPath, handleSuccessfulAdd, handleUnsuccessfulRequest, displaySlowImportModal);
-                }
+            openImportConfirmationModal(listName, membersToAdd.length).then(() => {
+                addMembersAsync(listName, groupingPath, membersToAdd);
             }, () => {/* onRejected: handles modal promise rejection */
             });
         };

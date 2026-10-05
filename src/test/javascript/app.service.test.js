@@ -322,6 +322,33 @@ describe("AppService", () => {
             expect(modal).not.toHaveBeenCalled();
         });
 
+        it("should not call the modal when the job completes before the time limit", () => {
+            httpBackend.expectPUT(endpoint, result).respond(200, 1);
+            httpBackend.flush();
+
+            httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(200, { status: "COMPLETED", result });
+            timeout.flush(initialPoll);
+            httpBackend.flush();
+            timeout.flush(20000);
+
+            expect(onSuccess).toHaveBeenCalledWith(result);
+            expect(modal).not.toHaveBeenCalled();
+        });
+
+        it("should not call the modal when polling fails before the time limit", () => {
+            httpBackend.expectPUT(endpoint, result).respond(200, 1);
+            httpBackend.flush();
+
+            httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(503);
+            timeout.flush(initialPoll);
+            httpBackend.flush();
+            timeout.flush(20000);
+
+            expect(onError).toHaveBeenCalled();
+            expect(onSuccess).not.toHaveBeenCalled();
+            expect(modal).not.toHaveBeenCalled();
+        });
+
         it("should call the modal on timeout", () => {
             httpBackend.expectPUT(endpoint, result).respond(200);
             timeout.flush();
@@ -330,5 +357,161 @@ describe("AppService", () => {
             expect(onSuccess).not.toHaveBeenCalled();
             expect(onError).not.toHaveBeenCalled();
         });
+    });
+
+    describe("polling an async job", () => {
+        let endpoint;
+        let jobPolled;
+
+        beforeEach(inject(($rootScope) => {
+            endpoint = BASE_URL + "/";
+            jobPolled = jasmine.createSpy("jobPolled");
+            $rootScope.$on("asyncJobPolled", jobPolled);
+            dp.updateDataWithBodyAndTimeoutModalAsync(endpoint, "data", initialPoll, onSuccess, onError, modal);
+            httpBackend.expectPUT(endpoint, "data").respond(200, 1);
+            httpBackend.flush();
+        }));
+
+        it("should broadcast asyncJobPolled for each answered poll, so the idle timeout does not log the user out", () => {
+            httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(200, { status: "IN_PROGRESS" });
+            timeout.flush(initialPoll);
+            httpBackend.flush();
+            expect(jobPolled).toHaveBeenCalledTimes(1);
+
+            httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(200, { status: "COMPLETED", result: "result" });
+            timeout.flush(5000);
+            httpBackend.flush();
+            expect(jobPolled).toHaveBeenCalledTimes(2);
+        });
+
+        it("should not broadcast asyncJobPolled when a poll fails", () => {
+            httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(503);
+            timeout.flush(initialPoll);
+            httpBackend.flush();
+
+            expect(jobPolled).not.toHaveBeenCalled();
+            expect(onError).toHaveBeenCalled();
+        });
+
+        it("should fail with status 404, and stop polling, when the API no longer has the job", () => {
+            httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(200, { id: 1, status: "NOT_FOUND", result: "" });
+            timeout.flush(initialPoll);
+            httpBackend.flush();
+            timeout.flush(20000);
+
+            httpBackend.verifyNoOutstandingRequest();
+            expect(onError).toHaveBeenCalledWith(jasmine.objectContaining({ status: 404 }));
+            expect(onSuccess).not.toHaveBeenCalled();
+            expect(jobPolled).not.toHaveBeenCalled();
+            expect(modal).not.toHaveBeenCalled();
+        });
+
+        it("should poll again after a poll that got no answer, since the job runs on", () => {
+            httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(-1);
+            timeout.flush(initialPoll);
+            httpBackend.flush();
+            expect(onError).not.toHaveBeenCalled();
+
+            httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(200, { status: "COMPLETED", result: "result" });
+            timeout.flush(5000);
+            httpBackend.flush();
+
+            expect(onSuccess).toHaveBeenCalledWith("result");
+            expect(onError).not.toHaveBeenCalled();
+        });
+
+        it("should fail once a minute of polls in a row got no answer", () => {
+            httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(-1);
+            timeout.flush(initialPoll);
+            httpBackend.flush();
+            for (let poll = 1; poll <= 12; poll++) {
+                expect(onError).not.toHaveBeenCalled();
+                httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(-1);
+                timeout.flush(5000);
+                httpBackend.flush();
+            }
+
+            expect(onError).toHaveBeenCalledTimes(1);
+            expect(onError).toHaveBeenCalledWith(jasmine.objectContaining({ status: -1 }));
+            timeout.flush(20000);
+            httpBackend.verifyNoOutstandingRequest();
+        });
+
+        it("should count only the polls in a row that got no answer", () => {
+            httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(-1);
+            timeout.flush(initialPoll);
+            httpBackend.flush();
+            for (let poll = 1; poll <= 11; poll++) {
+                httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(-1);
+                timeout.flush(5000);
+                httpBackend.flush();
+            }
+            httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(200, { status: "IN_PROGRESS" });
+            timeout.flush(5000);
+            httpBackend.flush();
+            httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(-1);
+            timeout.flush(5000);
+            httpBackend.flush();
+
+            expect(onError).not.toHaveBeenCalled();
+        });
+    });
+
+    describe("polling the progress of an async job", () => {
+        let endpoint;
+        let onProgress;
+
+        beforeEach(() => {
+            endpoint = BASE_URL + "/";
+            onProgress = jasmine.createSpy("onProgress");
+            dp.updateDataWithBodyAndTimeoutModalAsync(endpoint, "data", initialPoll, onSuccess, onError, modal,
+                onProgress);
+            httpBackend.expectPUT(endpoint, "data").respond(200, 1);
+            httpBackend.flush();
+        });
+
+        it("should pass on the progress of each poll of a job in progress", () => {
+            const validating = { phase: "VALIDATING", done: 1000, total: 12412 };
+            httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(200, { status: "IN_PROGRESS", progress: validating });
+            timeout.flush(initialPoll);
+            httpBackend.flush();
+            expect(onProgress).toHaveBeenCalledWith(validating);
+
+            const adding = { phase: "ADDING", done: 250, total: 12284 };
+            httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(200, { status: "IN_PROGRESS", progress: adding });
+            timeout.flush(5000);
+            httpBackend.flush();
+            expect(onProgress).toHaveBeenCalledWith(adding);
+
+            httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(200, { status: "COMPLETED", result: "result" });
+            timeout.flush(5000);
+            httpBackend.flush();
+            expect(onProgress).toHaveBeenCalledTimes(2);
+            expect(onSuccess).toHaveBeenCalledWith("result");
+        });
+
+        it("should not pass on progress that a job in progress does not report", () => {
+            httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(200, { status: "IN_PROGRESS", progress: null });
+            timeout.flush(initialPoll);
+            httpBackend.flush();
+
+            expect(onProgress).not.toHaveBeenCalled();
+        });
+    });
+
+    it("should poll a job that reports progress without a progress callback", () => {
+        dp.updateDataWithBodyAndTimeoutModalAsync(BASE_URL + "/", "data", initialPoll, onSuccess, onError, modal);
+        httpBackend.expectPUT(BASE_URL + "/", "data").respond(200, 1);
+        httpBackend.flush();
+
+        httpBackend.expectGET(`${BASE_URL}jobs/1`)
+            .respond(200, { status: "IN_PROGRESS", progress: { phase: "ADDING", done: 0, total: 1 } });
+        timeout.flush(initialPoll);
+        httpBackend.flush();
+        httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(200, { status: "COMPLETED", result: "result" });
+        timeout.flush(5000);
+        httpBackend.flush();
+
+        expect(onSuccess).toHaveBeenCalledWith("result");
     });
 });
