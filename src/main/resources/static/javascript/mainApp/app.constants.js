@@ -53,7 +53,7 @@ UHGroupingsApp.constant("Message", {
         INVALID_MULTI_ADD: "Only one owner-grouping can be added at a time.",
         INVALID_MULTI_REMOVE: "Only one owner-grouping can be removed at a time."
     },
-    // How far an import has gotten, by the phase the API reports (see dataProvider.pollData).
+    // How far an import has gotten, by the phase the API reports (see asyncJobPoller).
     ImportProgress: {
         VALIDATING: { with: (done, total) => `Checking ${done} of ${total} entries...` },
         REMOVING: { with: (done, total, listName) => `Removing ${done} of ${total} members from the ${listName} list...` },

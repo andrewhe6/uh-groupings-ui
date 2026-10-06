@@ -2315,6 +2315,9 @@ describe("GroupingController", () => {
             spyOn(uibModal, "open").and.callFake(() => createMockModal());
         });
 
+        const importConfirmationModalCount = () => uibModal.open.calls.allArgs()
+            .filter(([options]) => options.templateUrl === "modal/importConfirmationModal").length;
+
         describe("readTextFile", () => {
             it("should parse a CSV file, mark it as a file import, and add only the UH Number column", (done) => {
                 scope.listName = "Include";
@@ -2457,9 +2460,6 @@ describe("GroupingController", () => {
         });
 
         describe("addMembers - file import validation", () => {
-            const importConfirmationModalCount = () => uibModal.open.calls.allArgs()
-                .filter(([options]) => options.templateUrl === "modal/importConfirmationModal").length;
-
             beforeEach(() => {
                 spyOn(gs, "getMemberAttributeResultsAsync").and.callFake(gs.getMemberAttributeResults);
                 spyOn(gs, "addIncludeMembersAsync").and.callFake((members, path, onSuccess) => onSuccess({}));
@@ -2604,9 +2604,6 @@ describe("GroupingController", () => {
         describe("addMembers - large file import (more than threshold.MULTI_ADD entries)", () => {
             let identifiers;
             let invalidUhIdentifiers;
-
-            const importConfirmationModalCount = () => uibModal.open.calls.allArgs()
-                .filter(([options]) => options.templateUrl === "modal/importConfirmationModal").length;
 
             const addResult = () => ({ addResults: { results: [] }, removeResults: { results: [] }, invalidUhIdentifiers });
 
