@@ -339,7 +339,7 @@ describe("AppService", () => {
             httpBackend.expectPUT(endpoint, result).respond(200, 1);
             httpBackend.flush();
 
-            httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(503);
+            httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(403);
             timeout.flush(initialPoll);
             httpBackend.flush();
             timeout.flush(20000);
@@ -362,6 +362,17 @@ describe("AppService", () => {
     describe("polling an async job", () => {
         let endpoint;
         let jobPolled;
+        // The waits before each poll sent again after a poll that failed transiently, in a row.
+        const retryDelays = [5000, 10000, 20000, 30000, 30000, 30000, 30000, 30000];
+
+        /**
+         * Respond with the given response to the poll that is due after the given wait.
+         */
+        const respondToPoll = (wait, ...response) => {
+            httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(...response);
+            timeout.flush(wait);
+            httpBackend.flush();
+        };
 
         beforeEach(inject(($rootScope) => {
             endpoint = BASE_URL + "/";
@@ -385,12 +396,123 @@ describe("AppService", () => {
         });
 
         it("should not broadcast asyncJobPolled when a poll fails", () => {
-            httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(503);
+            httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(403);
             timeout.flush(initialPoll);
             httpBackend.flush();
 
             expect(jobPolled).not.toHaveBeenCalled();
             expect(onError).toHaveBeenCalled();
+        });
+
+        it("should not broadcast asyncJobPolled when a poll fails transiently", () => {
+            httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(503);
+            timeout.flush(initialPoll);
+            httpBackend.flush();
+
+            expect(jobPolled).not.toHaveBeenCalled();
+            expect(onError).not.toHaveBeenCalled();
+        });
+
+        [0, 408, 429, 500, 502, 503, 504].forEach((status) => {
+            it(`should poll again after a poll that failed with transient status ${status}, since the job runs on`,
+                () => {
+                    httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(status);
+                    timeout.flush(initialPoll);
+                    httpBackend.flush();
+                    expect(onError).not.toHaveBeenCalled();
+
+                    httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(200, { status: "COMPLETED", result: "result" });
+                    timeout.flush(5000);
+                    httpBackend.flush();
+
+                    expect(onSuccess).toHaveBeenCalledWith("result");
+                    expect(onError).not.toHaveBeenCalled();
+                });
+        });
+
+        [400, 401, 403, 404, 501].forEach((status) => {
+            it(`should fail with status ${status}, and stop polling, when a poll fails for good`, () => {
+                httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(status);
+                timeout.flush(initialPoll);
+                httpBackend.flush();
+                timeout.flush(20000);
+
+                httpBackend.verifyNoOutstandingRequest();
+                expect(onError).toHaveBeenCalledTimes(1);
+                expect(onError).toHaveBeenCalledWith(jasmine.objectContaining({ status }));
+                expect(onSuccess).not.toHaveBeenCalled();
+                expect(modal).not.toHaveBeenCalled();
+            });
+        });
+
+        it("should wait twice as long to poll again after each poll in a row that failed transiently, up to 30 s", () => {
+            respondToPoll(initialPoll, 503);
+            retryDelays.slice(0, -1).forEach((retryDelay) => {
+                timeout.flush(retryDelay - 1);
+                httpBackend.verifyNoOutstandingRequest();
+                respondToPoll(1, 503);
+            });
+
+            expect(onError).not.toHaveBeenCalled();
+        });
+
+        it("should fail with the last failed poll's status once the polls in a row that failed transiently run out",
+            () => {
+                const statuses = [503, -1, 502, 429, 504, 0, 500, 408, 502];
+                respondToPoll(initialPoll, statuses[0]);
+                statuses.slice(1).forEach((status, retry) => {
+                    expect(onError).not.toHaveBeenCalled();
+                    respondToPoll(retryDelays[retry], status);
+                });
+
+                expect(onError).toHaveBeenCalledTimes(1);
+                expect(onError).toHaveBeenCalledWith(jasmine.objectContaining({ status: 502 }));
+                expect(onSuccess).not.toHaveBeenCalled();
+                timeout.flush(60000);
+                httpBackend.verifyNoOutstandingRequest();
+            });
+
+        [
+            { status: 503, data: { resultCode: "BACKEND_UNAVAILABLE", message: "Groupings data is unavailable." } },
+            { status: 500, data: { resultCode: "FAILURE", message: "Runtime Exception" } }
+        ].forEach(({ status, data }) => {
+            it(`should fail at once with an error the API answered with (status ${status}), since it is the failure `
+                + "of the job, which every later poll would get too", () => {
+                respondToPoll(initialPoll, status, data);
+                timeout.flush(60000);
+
+                httpBackend.verifyNoOutstandingRequest();
+                expect(onError).toHaveBeenCalledTimes(1);
+                expect(onError).toHaveBeenCalledWith(jasmine.objectContaining({ status, data }));
+                expect(onSuccess).not.toHaveBeenCalled();
+                expect(modal).not.toHaveBeenCalled();
+            });
+        });
+
+        it("should fail with status 404, and stop polling, when the job is gone after a poll that failed transiently "
+            + "(e.g. the API restarted meanwhile)", () => {
+            respondToPoll(initialPoll, 502);
+            respondToPoll(5000, 200, { id: 1, status: "NOT_FOUND", result: "" });
+            timeout.flush(60000);
+
+            httpBackend.verifyNoOutstandingRequest();
+            expect(onError).toHaveBeenCalledTimes(1);
+            expect(onError).toHaveBeenCalledWith(jasmine.objectContaining({ status: 404 }));
+            expect(onSuccess).not.toHaveBeenCalled();
+        });
+
+        it("should fail for good on a poll that fails for good after polls that failed transiently", () => {
+            httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(503);
+            timeout.flush(initialPoll);
+            httpBackend.flush();
+            httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(401);
+            timeout.flush(5000);
+            httpBackend.flush();
+
+            expect(onError).toHaveBeenCalledTimes(1);
+            expect(onError).toHaveBeenCalledWith(jasmine.objectContaining({ status: 401 }));
+            timeout.flush(20000);
+            httpBackend.verifyNoOutstandingRequest();
         });
 
         it("should fail with status 404, and stop polling, when the API no longer has the job", () => {
@@ -420,40 +542,28 @@ describe("AppService", () => {
             expect(onError).not.toHaveBeenCalled();
         });
 
-        it("should fail once a minute of polls in a row got no answer", () => {
-            httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(-1);
-            timeout.flush(initialPoll);
-            httpBackend.flush();
-            for (let poll = 1; poll <= 12; poll++) {
+        it("should fail once about 3 minutes of polls in a row got no answer", () => {
+            respondToPoll(initialPoll, -1);
+            retryDelays.forEach((retryDelay) => {
                 expect(onError).not.toHaveBeenCalled();
-                httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(-1);
-                timeout.flush(5000);
-                httpBackend.flush();
-            }
+                respondToPoll(retryDelay, -1);
+            });
 
             expect(onError).toHaveBeenCalledTimes(1);
             expect(onError).toHaveBeenCalledWith(jasmine.objectContaining({ status: -1 }));
-            timeout.flush(20000);
+            timeout.flush(60000);
             httpBackend.verifyNoOutstandingRequest();
         });
 
-        it("should count only the polls in a row that got no answer", () => {
-            httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(-1);
-            timeout.flush(initialPoll);
-            httpBackend.flush();
-            for (let poll = 1; poll <= 11; poll++) {
-                httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(-1);
-                timeout.flush(5000);
-                httpBackend.flush();
-            }
-            httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(200, { status: "IN_PROGRESS" });
-            timeout.flush(5000);
-            httpBackend.flush();
-            httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(-1);
-            timeout.flush(5000);
-            httpBackend.flush();
+        it("should count only the polls in a row that got no answer, and wait 5 s again after an answered poll", () => {
+            respondToPoll(initialPoll, -1);
+            retryDelays.slice(0, -1).forEach((retryDelay) => respondToPoll(retryDelay, -1));
+            respondToPoll(retryDelays[retryDelays.length - 1], 200, { status: "IN_PROGRESS" });
+            respondToPoll(5000, -1);
+            respondToPoll(5000, 200, { status: "COMPLETED", result: "result" });
 
             expect(onError).not.toHaveBeenCalled();
+            expect(onSuccess).toHaveBeenCalledWith("result");
         });
     });
 
@@ -514,4 +624,34 @@ describe("AppService", () => {
 
         expect(onSuccess).toHaveBeenCalledWith("result");
     });
+});
+
+describe("asyncJobPoller", () => {
+
+    beforeEach(module("UHGroupingsApp"));
+    beforeEach(module("ngMockE2E"));
+    // An error thrown in a promise callback is reported as a possibly unhandled rejection: log it, not rethrow it.
+    beforeEach(module(($exceptionHandlerProvider) => {
+        $exceptionHandlerProvider.mode("log");
+    }));
+
+    it("should keep polling a job when handling its progress fails",
+        inject((asyncJobPoller, $httpBackend, $timeout, BASE_URL) => {
+            const onSuccess = jasmine.createSpy("onSuccess");
+            const onError = jasmine.createSpy("onError");
+            const onProgress = jasmine.createSpy("onProgress").and.throwError("progress display failed");
+            asyncJobPoller(1, onSuccess, onError, undefined, onProgress);
+
+            $httpBackend.expectGET(`${BASE_URL}jobs/1`)
+                .respond(200, { status: "IN_PROGRESS", progress: { phase: "ADDING", done: 0, total: 1 } });
+            $httpBackend.flush();
+            expect(onProgress).toHaveBeenCalled();
+
+            $httpBackend.expectGET(`${BASE_URL}jobs/1`).respond(200, { status: "COMPLETED", result: "result" });
+            $timeout.flush(5000);
+            $httpBackend.flush();
+
+            expect(onSuccess).toHaveBeenCalledWith("result");
+            expect(onError).not.toHaveBeenCalled();
+        }));
 });
